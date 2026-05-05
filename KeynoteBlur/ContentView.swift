@@ -18,6 +18,7 @@ final class KeynoteBlurViewModel: ObservableObject {
     @Published var originalImage: NSImage? = nil
     @Published var blurRadius: Double = 0
     @Published var hasMaskTemplateAvailable: Bool = false
+    @Published var prefersPNGCopy: Bool = false
 
     private let ciContext = CIContext(options: nil)
     private var lastObservedPasteboardChangeCount: Int = -1
@@ -28,6 +29,7 @@ final class KeynoteBlurViewModel: ObservableObject {
     private let keynoteHasNativeDrawablesType = NSPasteboard.PasteboardType("com.apple.iWork.pasteboardState.hasNativeDrawables")
     private let defaultSlideSize = CGSize(width: 1920, height: 1080)
     private let maxImportedImageSize = CGSize(width: 1920, height: 1080)
+    private let maxCopiedImageSlideOccupancy: CGFloat = 0.8
 
     private init() {
         refreshMaskTemplateAvailability(force: true)
@@ -37,18 +39,22 @@ final class KeynoteBlurViewModel: ObservableObject {
     func pasteSlideFromPasteboard() -> Bool {
         let pb = NSPasteboard.general
 
-        if let img = imageFromPasteboard(pb) {
-            setImportedImage(img)
+        if let importedImage = importedImageFromPasteboard(pb) {
+            setImportedImage(importedImage.image, prefersPNGCopy: importedImage.prefersPNGCopy)
             return true
         }
 
         if let url = imageURLFromPasteboardText(pb) {
             Task { [weak self] in
                 guard let self,
-                      let image = await self.fetchImageFromURL(url) else { return }
+                      let importedImage = await self.fetchImageFromURL(url) else { return }
 
                 await MainActor.run {
-                    self.setImportedImage(image, downsizeToPreviewBounds: true)
+                    self.setImportedImage(
+                        importedImage.image,
+                        prefersPNGCopy: importedImage.prefersPNGCopy,
+                        downsizeToPreviewBounds: true
+                    )
                 }
             }
             return true
@@ -59,7 +65,7 @@ final class KeynoteBlurViewModel: ObservableObject {
 
     func canPasteFromPasteboard() -> Bool {
         let pb = NSPasteboard.general
-        return imageFromPasteboard(pb) != nil || imageURLFromPasteboardText(pb) != nil
+        return importedImageFromPasteboard(pb) != nil || imageURLFromPasteboardText(pb) != nil
     }
 
     var processedImage: NSImage? {
@@ -72,14 +78,14 @@ final class KeynoteBlurViewModel: ObservableObject {
     func copySlideForKeynote() {
         guard let base = processedImage ?? originalImage else { return }
 
-        let imageDisplaySize = CGSize(width: max(1, base.size.width), height: max(1, base.size.height))
+        let imageDisplaySize = displaySizeForCopiedImage(base.size, slideSize: defaultSlideSize)
         let placement = placementGeometry(forImageSize: imageDisplaySize, slideSize: defaultSlideSize)
         let adaptiveFactor = adaptiveScaleFactor(forBlurRadius: blurRadius)
         let finalScaleFactor = adaptiveFactor
         let scaledImage = scaleImage(base, factor: finalScaleFactor)
-        guard let mainJpegData = jpegData(from: scaledImage, quality: 0.9) else { return }
+        guard let mainImageData = encodedCopyData(from: scaledImage, quality: 0.9) else { return }
         let thumbnail = thumbnailImage(from: scaledImage, maxDimension: 256)
-        guard let thumbnailData = jpegData(from: thumbnail, quality: 0.8) else { return }
+        guard let thumbnailData = encodedCopyData(from: thumbnail, quality: 0.8) else { return }
 
 
         let pb = NSPasteboard.general
@@ -114,7 +120,8 @@ final class KeynoteBlurViewModel: ObservableObject {
             drawableGeometry: drawableGeometry
         )
 
-        let digest = Data(Insecure.SHA1.hash(data: mainJpegData))
+        let fileExtension = prefersPNGCopy ? "png" : "jpg"
+        let digest = Data(Insecure.SHA1.hash(data: mainImageData))
         let thumbDigest = Data(Insecure.SHA1.hash(data: thumbnailData))
         let metadata = KeynotePasteboardEncoder.buildMetadata(
             appName: "com.apple.Keynote 14.5",
@@ -123,21 +130,21 @@ final class KeynoteBlurViewModel: ObservableObject {
                 KeynoteMetadataDataEntry(
                     identifier: dataIdentifier,
                     digest: digest,
-                    preferredFileName: "KeynoteBlurSlide.jpg",
-                    fileName: "KeynoteBlurSlide.jpg"
+                    preferredFileName: "KeynoteBlurSlide.\(fileExtension)",
+                    fileName: "KeynoteBlurSlide.\(fileExtension)"
                 ),
                 KeynoteMetadataDataEntry(
                     identifier: thumbnailDataIdentifier,
                     digest: thumbDigest,
-                    preferredFileName: "KeynoteBlurSlide-thumb.jpg",
-                    fileName: "KeynoteBlurSlide-thumb.jpg"
+                    preferredFileName: "KeynoteBlurSlide-thumb.\(fileExtension)",
+                    fileName: "KeynoteBlurSlide-thumb.\(fileExtension)"
                 )
             ]
         )
 
         pb.clearContents()
 
-        _ = pb.setData(mainJpegData, forType: iWorkDataType(for: dataIdentifier))
+        _ = pb.setData(mainImageData, forType: iWorkDataType(for: dataIdentifier))
         _ = pb.setData(thumbnailData, forType: iWorkDataType(for: thumbnailDataIdentifier))
         _ = pb.setData(nativeData, forType: keynoteNativeDataType)
         _ = pb.setData(metadata, forType: keynoteNativeMetadataType)
@@ -175,7 +182,7 @@ final class KeynoteBlurViewModel: ObservableObject {
     func copyMaskedSlideForKeynoteFromTemplate() -> Bool {
         guard let base = processedImage ?? originalImage else { return false }
 
-        let imageDisplaySize = CGSize(width: max(1, base.size.width), height: max(1, base.size.height))
+        let imageDisplaySize = displaySizeForCopiedImage(base.size, slideSize: defaultSlideSize)
         let adaptiveFactor = adaptiveScaleFactor(forBlurRadius: blurRadius)
         let scaledImage = scaleImage(base, factor: adaptiveFactor)
         guard let mainJpegData = jpegData(from: scaledImage, quality: 0.9) else { return false }
@@ -210,6 +217,11 @@ final class KeynoteBlurViewModel: ObservableObject {
 
         refreshMaskTemplateAvailability(force: true)
         return false
+    }
+
+    private struct ImportedImage {
+        let image: NSImage
+        let prefersPNGCopy: Bool
     }
 
     private struct ImageMaskTemplate {
@@ -568,27 +580,81 @@ final class KeynoteBlurViewModel: ObservableObject {
 
     // MARK: - Image Ops
 
-    private func imageFromPasteboard(_ pb: NSPasteboard) -> NSImage? {
-        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage],
-           let image = images.first {
-            return image
-        }
-
-        if let data = pb.data(forType: .tiff), let image = NSImage(data: data) {
-            return image
-        }
-
+    private func importedImageFromPasteboard(_ pb: NSPasteboard) -> ImportedImage? {
         let pngType = NSPasteboard.PasteboardType(UTType.png.identifier)
-        if let data = pb.data(forType: pngType), let image = NSImage(data: data) {
-            return image
+        if let data = pb.data(forType: pngType), let importedImage = importedImage(from: data) {
+            return importedImage
         }
 
         let jpegType = NSPasteboard.PasteboardType(UTType.jpeg.identifier)
-        if let data = pb.data(forType: jpegType), let image = NSImage(data: data) {
-            return image
+        if let data = pb.data(forType: jpegType), let importedImage = importedImage(from: data) {
+            return importedImage
+        }
+
+        if let data = pb.data(forType: .tiff), let image = NSImage(data: data) {
+            return ImportedImage(image: image, prefersPNGCopy: false)
+        }
+
+        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage],
+           let image = images.first {
+            return ImportedImage(image: image, prefersPNGCopy: false)
         }
 
         return nil
+    }
+
+    private func importedImage(from data: Data) -> ImportedImage? {
+        guard let image = NSImage(data: data) else { return nil }
+        let prefersPNGCopy = isPNGData(data) && hasTransparentCornerPixel(in: data)
+        return ImportedImage(image: image, prefersPNGCopy: prefersPNGCopy)
+    }
+
+    private func isPNGData(_ data: Data) -> Bool {
+        let pngSignature: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        return data.starts(with: pngSignature)
+    }
+
+    private func hasTransparentCornerPixel(in data: Data) -> Bool {
+        guard let rep = NSBitmapImageRep(data: data) else { return false }
+        let width = rep.pixelsWide
+        let height = rep.pixelsHigh
+        guard width > 0, height > 0, rep.hasAlpha else { return false }
+
+        let cornerPoints = [
+            (x: 0, y: 0),
+            (x: width - 1, y: 0),
+            (x: 0, y: height - 1),
+            (x: width - 1, y: height - 1)
+        ]
+
+        return cornerPoints.contains { point in
+            guard let color = rep.colorAt(x: point.x, y: point.y) else { return false }
+            return color.alphaComponent < 0.999
+        }
+    }
+
+    private func displaySizeForCopiedImage(_ imageSize: CGSize, slideSize: CGSize) -> CGSize {
+        let clampedImageSize = CGSize(
+            width: max(1, imageSize.width),
+            height: max(1, imageSize.height)
+        )
+        let maxDisplaySize = CGSize(
+            width: max(1, slideSize.width * maxCopiedImageSlideOccupancy),
+            height: max(1, slideSize.height * maxCopiedImageSlideOccupancy)
+        )
+
+        guard clampedImageSize.width > slideSize.width || clampedImageSize.height > slideSize.height else {
+            return clampedImageSize
+        }
+
+        let factor = min(
+            maxDisplaySize.width / clampedImageSize.width,
+            maxDisplaySize.height / clampedImageSize.height
+        )
+        return CGSize(
+            width: max(1, clampedImageSize.width * factor),
+            height: max(1, clampedImageSize.height * factor)
+        )
     }
 
     private func placementGeometry(forImageSize imageSize: CGSize, slideSize: CGSize) -> (showSize: CGSize, geometry: KeynotePBGeometry) {
@@ -613,9 +679,10 @@ final class KeynoteBlurViewModel: ObservableObject {
         return (showSize, geometry)
     }
 
-    private func setImportedImage(_ image: NSImage, downsizeToPreviewBounds: Bool = false) {
+    private func setImportedImage(_ image: NSImage, prefersPNGCopy: Bool, downsizeToPreviewBounds: Bool = false) {
         blurRadius = 0
         originalImage = downsizeToPreviewBounds ? downsizeIfNeeded(image, maxSize: maxImportedImageSize) : image
+        self.prefersPNGCopy = prefersPNGCopy
     }
 
     private func imageURLFromPasteboardText(_ pb: NSPasteboard) -> URL? {
@@ -657,12 +724,12 @@ final class KeynoteBlurViewModel: ObservableObject {
         return scheme == "http" || scheme == "https" || scheme == "file"
     }
 
-    private func fetchImageFromURL(_ url: URL) async -> NSImage? {
+    private func fetchImageFromURL(_ url: URL) async -> ImportedImage? {
         if url.isFileURL {
-            guard let data = try? Data(contentsOf: url), let image = NSImage(data: data) else {
+            guard let data = try? Data(contentsOf: url) else {
                 return nil
             }
-            return image
+            return importedImage(from: data)
         }
 
         var request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 30)
@@ -674,7 +741,7 @@ final class KeynoteBlurViewModel: ObservableObject {
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             return nil
         }
-        return NSImage(data: data)
+        return importedImage(from: data)
     }
 
     private func downsizeIfNeeded(_ image: NSImage, maxSize: CGSize) -> NSImage {
@@ -755,6 +822,18 @@ final class KeynoteBlurViewModel: ObservableObject {
             return nil
         }
         return rep.representation(using: .jpeg, properties: [.compressionFactor: quality])
+    }
+
+    private func pngData(from image: NSImage) -> Data? {
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff) else {
+            return nil
+        }
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    private func encodedCopyData(from image: NSImage, quality: CGFloat) -> Data? {
+        prefersPNGCopy ? pngData(from: image) : jpegData(from: image, quality: quality)
     }
 
     private func thumbnailImage(from image: NSImage, maxDimension: CGFloat) -> NSImage {
@@ -1567,7 +1646,7 @@ struct ContentView: View {
     }
 
     private var copyButtonTitle: String {
-        shouldUseMaskedCopy ? "copy masked image to clipboard" : "copy image to clipboard"
+        shouldUseMaskedCopy ? "copy masked image to clipboard" : "copy \(vm.prefersPNGCopy ? "PNG" : "JPG") to clipboard"
     }
 
     var body: some View {
